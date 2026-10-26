@@ -1,0 +1,788 @@
+-- Sniper Duels: auto aim, controlled auto shoot, red enemy ESP.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local me = Players.LocalPlayer
+local env = getgenv()
+if type(env.SniperDuelsCleanup) == "function" then pcall(env.SniperDuelsCleanup) end
+-- Stop the previously running Bloxstrike controls when switching games.
+if type(env.BloxstrikeFireCleanup) == "function" then pcall(env.BloxstrikeFireCleanup) end
+if type(env.BloxstrikeESPCleanup) == "function" then pcall(env.BloxstrikeESPCleanup) end
+RunService:UnbindFromRenderStep("BloxstrikeAutoLock")
+local old = me.PlayerGui:FindFirstChild("AimBotUI")
+if old then old:Destroy() end
+
+local settings = {
+    Aim = true, Shoot = true, ESP = true, TargetBots = true, BotESP = true,
+    HoldAim = false, FOVEnabled = true, FOVRadius = 220, AutoSave = true,
+    Diagnostics = true, Preset = "Sniper", ShotInterval = 0.9,
+    PlayerColor = "FF2323", BotColor = "FF8C32", OutlineColor = "FFFFFF",
+    ESPHighlights = true, ESPOutline = true, ESPNames = true, ESPHealth = true,
+    ESPDistance = false, ESPThroughWalls = true, ESPFillOpacity = 50,
+    ESPMaxDistance = 0, ESPTextSize = 13,
+    InfiniteJump = false, CustomSpeed = false, PlayerSpeed = 19.5,
+}
+local defaults = table.clone(settings)
+local HttpService = game:GetService("HttpService")
+local saveFile = "SniperDuels_settings_v2.json"
+local savedPosition = nil
+local saveState = "Session settings"
+local diskOK = type(readfile) == "function" and type(writefile) == "function"
+local saved = env.SniperDuelsSavedSettings
+if diskOK then
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(saveFile)) end)
+    if ok and type(data) == "table" then saved = data end
+end
+if type(saved) == "table" then
+    for key, default in pairs(defaults) do
+        if type(saved[key]) == type(default) then settings[key] = saved[key] end
+    end
+    if type(saved.PanelX) == "number" and type(saved.PanelY) == "number" then
+        savedPosition = Vector2.new(saved.PanelX, saved.PanelY)
+    end
+end
+settings.FOVRadius = math.clamp(settings.FOVRadius, 60, 600)
+for _, key in ipairs({"PlayerColor", "BotColor", "OutlineColor"}) do
+    settings[key] = settings[key]:gsub("#", ""):upper()
+    if not settings[key]:match("^%x%x%x%x%x%x$") then settings[key] = defaults[key] end
+end
+settings.ESPFillOpacity = math.clamp(settings.ESPFillOpacity, 0, 100)
+settings.ESPMaxDistance = math.clamp(settings.ESPMaxDistance, 0, 10000)
+settings.ESPTextSize = math.clamp(settings.ESPTextSize, 10, 24)
+settings.PlayerSpeed = math.clamp(settings.PlayerSpeed, 0, 100)
+local presets = {Sniper = 0.9, Precision = 1.3, Semi = 0.4}
+if not presets[settings.Preset] then settings.Preset = "Sniper" end
+settings.ShotInterval = presets[settings.Preset]
+local paused = false
+local panel
+local function saveSettings(force)
+    if not force and not settings.AutoSave then return end
+    local data = table.clone(settings)
+    if panel then data.PanelX = panel.AbsolutePosition.X data.PanelY = panel.AbsolutePosition.Y end
+    env.SniperDuelsSavedSettings = data
+    saveState = "Saved for this session"
+    if diskOK then
+        local ok = pcall(function() writefile(saveFile, HttpService:JSONEncode(data)) end)
+        saveState = ok and "Saved to disk" or "Disk save failed; session saved"
+    end
+end
+local connections, entries = {}, {}
+local target, acquiredAt = nil, 0
+local lastVisibleAt = 0
+local retentionGrace = 0.18
+local focused, held, releaseAt, nextShot = true, false, 0, 0
+local function connect(signal, fn)
+    table.insert(connections, signal:Connect(fn))
+end
+local function release()
+    if held then mouse1release() held = false end
+end
+connect(UIS.WindowFocusReleased, function() focused = false release() end)
+connect(UIS.WindowFocused, function() focused = true end)
+
+-- Infinite jump follows the current character across respawns.
+local lastJumpAt = 0
+connect(UIS.JumpRequest, function()
+    if not settings.InfiniteJump or not focused or UIS:GetFocusedTextBox() then return end
+    local now = os.clock()
+    if now - lastJumpAt < 0.12 then return end
+    local character = me.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or humanoid.Sit or not root or root.Anchored then return end
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.Swimming or state == Enum.HumanoidStateType.Climbing then return end
+    if humanoid.FloorMaterial == Enum.Material.Air then
+        lastJumpAt = now
+        local gravity = math.max(workspace.Gravity, 0)
+        local speed = humanoid.UseJumpPower and humanoid.JumpPower
+            or math.sqrt(2 * gravity * math.max(humanoid.JumpHeight, 0))
+        if speed <= 0 then return end
+        local velocity = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(velocity.X, speed, velocity.Z)
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+-- Apply speed to both the custom entity attribute and Roblox Humanoid.
+local speedHumanoid = nil
+local originalSpeed = nil
+local originalSpeedAttribute = nil
+local speedApplied = false
+local speedPropertyConnection = nil
+local changingSpeed = false
+local function restoreSpeed()
+    if speedApplied then
+        speedApplied = false
+        me:SetAttribute("WalkSpeed", originalSpeedAttribute)
+        if speedHumanoid and speedHumanoid.Parent and originalSpeed then
+            speedHumanoid.WalkSpeed = originalSpeed
+        end
+    end
+    speedApplied = false
+end
+local function applySpeed()
+    local humanoid = me.Character and me.Character:FindFirstChildOfClass("Humanoid")
+    if humanoid ~= speedHumanoid then
+        restoreSpeed()
+        if speedPropertyConnection then speedPropertyConnection:Disconnect() speedPropertyConnection = nil end
+        speedHumanoid = humanoid
+        if humanoid then
+            speedPropertyConnection = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                if speedApplied and settings.CustomSpeed and not changingSpeed and humanoid.WalkSpeed ~= settings.PlayerSpeed then
+                    changingSpeed = true
+                    humanoid.WalkSpeed = settings.PlayerSpeed
+                    changingSpeed = false
+                end
+            end)
+        end
+        originalSpeed = humanoid and humanoid.WalkSpeed or nil
+        originalSpeedAttribute = me:GetAttribute("WalkSpeed")
+    end
+    if settings.CustomSpeed and humanoid and humanoid.Health > 0 then
+        if not speedApplied then
+            originalSpeed = humanoid.WalkSpeed
+            originalSpeedAttribute = me:GetAttribute("WalkSpeed")
+        end
+        speedApplied = true
+        if me:GetAttribute("WalkSpeed") ~= settings.PlayerSpeed then
+            me:SetAttribute("WalkSpeed", settings.PlayerSpeed)
+        end
+        if humanoid.WalkSpeed ~= settings.PlayerSpeed then humanoid.WalkSpeed = settings.PlayerSpeed end
+    elseif speedApplied then
+        restoreSpeed()
+    end
+end
+connect(RunService.PreSimulation, applySpeed)
+RunService:BindToRenderStep("SniperDuelsSpeed", Enum.RenderPriority.Input.Value - 1, applySpeed)
+applySpeed()
+
+local function teamOf(p) return p:GetAttribute("Team") or p.Team end
+local function validEnemy(p, forESP)
+    if not forESP and type(p) == "table" and not settings.TargetBots then return nil end
+    if p == me or p.Parent ~= Players then return nil end
+    local ownWorld, otherWorld = me:GetAttribute("World"), p:GetAttribute("World")
+    local ownRoom, otherRoom = me:GetAttribute("GameRoom"), p:GetAttribute("GameRoom")
+    if ownWorld ~= nil and otherWorld ~= nil and ownWorld ~= otherWorld then return nil end
+    if ownRoom ~= nil and otherRoom ~= nil and ownRoom ~= otherRoom then return nil end
+    local ownTeam, otherTeam = teamOf(me), teamOf(p)
+    -- This arcade room assigns every participant Team3; it is not a friendship filter.
+
+    local c = p.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    local entityHealth = p:GetAttribute("Health")
+    if p:GetAttribute("State") == "Dead" or (type(entityHealth) == "number" and entityHealth <= 0) then return nil end
+    local head = c and c:FindFirstChild("Head")
+    if not c or not c:IsDescendantOf(workspace) or (h and h.Health <= 0) or (not h and type(p) ~= "table")
+        or not head or not head:IsA("BasePart") then return nil end
+
+    local shield = p:GetAttribute("TempShield")
+
+    return head, c, {Health = type(entityHealth) == "number" and entityHealth or (h and h.Health or 100)}
+end
+local function visible(camera, part)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {camera}
+    if me.Character then table.insert(excluded, me.Character) end
+    params.FilterDescendantsInstances = excluded
+    local hit = workspace:Raycast(camera.CFrame.Position, part.Position - camera.CFrame.Position, params)
+    local targetModel = part.Parent
+    local ancestor = targetModel
+    while ancestor and ancestor ~= workspace do
+        if ancestor:GetAttribute("FakeUserId") ~= nil then targetModel = ancestor break end
+        ancestor = ancestor.Parent
+    end
+    return not hit or hit.Instance:IsDescendantOf(targetModel)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "SniperDuelsControls"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 80
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = me:WaitForChild("PlayerGui")
+local TweenService = game:GetService("TweenService")
+local accent = Color3.fromRGB(120, 160, 255)
+local function make(class, parent, props)
+    local item = Instance.new(class)
+    for key, value in pairs(props or {}) do item[key] = value end
+    item.Parent = parent
+    return item
+end
+local function round(item, radius) make("UICorner", item, {CornerRadius = UDim.new(0, radius)}) end
+local function text(parent, caption, position, size, fontSize, color)
+    return make("TextLabel", parent, {Text = caption, Position = position, Size = size,
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = fontSize,
+        TextColor3 = color or Color3.fromRGB(235, 239, 250), TextXAlignment = Enum.TextXAlignment.Left})
+end
+local view = workspace.CurrentCamera.ViewportSize
+local panelHeight = math.min(646, math.max(420, view.Y - 60))
+panel = make("Frame", gui, {Size = UDim2.fromOffset(370, panelHeight),
+    Position = UDim2.fromOffset(savedPosition and math.clamp(savedPosition.X, 0, math.max(0, view.X - 370)) or 24,
+        savedPosition and math.clamp(savedPosition.Y, 0, math.max(0, view.Y - panelHeight)) or math.max(15, (view.Y - panelHeight) / 2)),
+    BackgroundColor3 = Color3.fromRGB(17, 20, 28), BorderSizePixel = 0, ClipsDescendants = true})
+round(panel, 15)
+make("UIStroke", panel, {Color = Color3.fromRGB(59, 69, 91), Transparency = 0.25})
+local header = make("Frame", panel, {Size = UDim2.new(1, 0, 0, 74),
+    BackgroundColor3 = Color3.fromRGB(25, 34, 51), BorderSizePixel = 0, Active = true})
+local title = text(header, "SNIPER DUELS", UDim2.fromOffset(20, 16), UDim2.fromOffset(270, 25), 19)
+title.Font = Enum.Font.GothamBold
+text(header, "CONTROL CENTER / ALL FEATURES", UDim2.fromOffset(21, 43), UDim2.fromOffset(290, 16), 10, Color3.fromRGB(144, 166, 202))
+local collapse = make("TextButton", header, {Position = UDim2.new(1, -44, 0, 22), Size = UDim2.fromOffset(28, 28),
+    Text = "-", Font = Enum.Font.GothamBold, TextSize = 20, TextColor3 = accent,
+    BackgroundColor3 = Color3.fromRGB(39, 50, 72), BorderSizePixel = 0})
+round(collapse, 8)
+local content = make("Frame", panel, {Position = UDim2.fromOffset(0, 74), Size = UDim2.new(1, 0, 1, -74), BackgroundTransparency = 1})
+local scroll = make("ScrollingFrame", content, {Position = UDim2.fromOffset(12, 10), Size = UDim2.new(1, -24, 1, -145),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+    ScrollBarImageColor3 = accent, CanvasSize = UDim2.fromOffset(0, 0)})
+local cursor = 0
+local refreshers = {}
+local function heading(caption)
+    text(scroll, caption, UDim2.fromOffset(6, cursor), UDim2.new(1, -12, 0, 24), 10, Color3.fromRGB(133, 158, 196))
+    cursor = cursor + 30
+end
+local function toggle(key, caption, description)
+    local row = make("TextButton", scroll, {Position = UDim2.fromOffset(0, cursor), Size = UDim2.new(1, -8, 0, 58),
+        Text = "", AutoButtonColor = false, BackgroundColor3 = Color3.fromRGB(25, 31, 43), BorderSizePixel = 0})
+    round(row, 9)
+    text(row, caption, UDim2.fromOffset(12, 9), UDim2.new(1, -75, 0, 19), 13)
+    text(row, description, UDim2.fromOffset(12, 32), UDim2.new(1, -18, 0, 15), 10, Color3.fromRGB(142, 158, 182))
+    local track = make("Frame", row, {Position = UDim2.new(1, -50, 0, 10), Size = UDim2.fromOffset(36, 20), BorderSizePixel = 0})
+    round(track, 10)
+    local knob = make("Frame", track, {Size = UDim2.fromOffset(14, 14), BackgroundColor3 = Color3.fromRGB(245, 248, 255), BorderSizePixel = 0})
+    round(knob, 7)
+    local function refresh()
+        TweenService:Create(track, TweenInfo.new(0.12), {BackgroundColor3 = settings[key] and accent or Color3.fromRGB(56, 65, 82)}):Play()
+        TweenService:Create(knob, TweenInfo.new(0.12), {Position = UDim2.fromOffset(settings[key] and 19 or 3, 3)}):Play()
+    end
+    table.insert(refreshers, refresh)
+    connect(row.Activated, function()
+        settings[key] = not settings[key]
+        if key == "Aim" or key == "Shoot" or key == "HoldAim" or key == "TargetBots" then release() target = nil end
+        refresh()
+        saveSettings(key == "AutoSave")
+    end)
+    refresh()
+    cursor = cursor + 65
+end
+local function action(caption, callback)
+    local button = make("TextButton", scroll, {Position = UDim2.fromOffset(0, cursor), Size = UDim2.new(1, -8, 0, 38),
+        Text = caption, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Color3.fromRGB(210, 223, 249),
+        BackgroundColor3 = Color3.fromRGB(35, 46, 67), BorderSizePixel = 0})
+    round(button, 8)
+    connect(button.Activated, function() callback(button) end)
+    cursor = cursor + 46
+    return button
+end
+heading("01 / AIM")
+toggle("Aim", "Auto aim", "Lock onto a visible head in front")
+toggle("HoldAim", "Hold right-click to aim", "OFF = automatic / ON = hold right mouse")
+toggle("TargetBots", "Target bots", "Include bots in auto aim and auto shoot")
+toggle("FOVEnabled", "Aim FOV circle", "Limit new targets to the circle")
+local radiusChoices = {100, 150, 220, 320, 450, 600}
+local radiusButton
+radiusButton = action("Aim radius: " .. settings.FOVRadius .. " px", function(button)
+    local i = table.find(radiusChoices, settings.FOVRadius) or 0
+    settings.FOVRadius = radiusChoices[i % #radiusChoices + 1]
+    button.Text = "Aim radius: " .. settings.FOVRadius .. " px"
+    saveSettings(false)
+end)
+heading("02 / SHOOT")
+toggle("Shoot", "Auto shoot", "Fire only after a clear head lock")
+local presetOrder = {"Sniper", "Precision", "Semi"}
+local presetButton
+presetButton = action("Firing preset: " .. settings.Preset .. " / " .. settings.ShotInterval .. "s", function(button)
+    local i = table.find(presetOrder, settings.Preset) or 1
+    settings.Preset = presetOrder[i % #presetOrder + 1]
+    settings.ShotInterval = presets[settings.Preset]
+    release()
+    button.Text = "Firing preset: " .. settings.Preset .. " / " .. settings.ShotInterval .. "s"
+    saveSettings(false)
+end)
+heading("03 / ESP")
+toggle("ESP", "Player ESP", "Show real players through walls")
+toggle("BotESP", "Bot ESP", "Show bots independently from players")
+heading("ESP / COLORS")
+local colorPresets = {"FF2323", "FF8C32", "FFD54A", "54E89C", "55C8FF", "9F83FF", "FF77C8", "FFFFFF"}
+local function colorControl(key, caption)
+    local row = make("Frame", scroll, {Position = UDim2.fromOffset(0, cursor),
+        Size = UDim2.new(1, -8, 0, 62), BackgroundColor3 = Color3.fromRGB(25, 31, 43), BorderSizePixel = 0})
+    round(row, 9)
+    text(row, caption, UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 17), 12)
+    local input = make("TextBox", row, {Position = UDim2.fromOffset(12, 29), Size = UDim2.fromOffset(130, 25),
+        BackgroundColor3 = Color3.fromRGB(16, 21, 30), BorderSizePixel = 0, ClearTextOnFocus = false,
+        Font = Enum.Font.Code, TextSize = 13, TextColor3 = Color3.fromRGB(225, 235, 250)})
+    round(input, 5)
+    local swatch = make("TextButton", row, {Position = UDim2.new(1, -175, 0, 29), Size = UDim2.fromOffset(157, 25),
+        Text = "NEXT COLOR", Font = Enum.Font.GothamBold, TextSize = 9, BorderSizePixel = 0})
+    round(swatch, 5)
+    local function refresh()
+        local color = Color3.fromHex(settings[key])
+        input.Text = "#" .. settings[key]
+        input.TextColor3 = Color3.fromRGB(225, 235, 250)
+        swatch.BackgroundColor3 = color
+        swatch.TextColor3 = (color.R * 0.299 + color.G * 0.587 + color.B * 0.114) > 0.6
+            and Color3.fromRGB(15, 20, 28) or Color3.new(1, 1, 1)
+    end
+    connect(input.FocusLost, function()
+        local value = input.Text:gsub("#", ""):gsub("%s", ""):upper()
+        if value:match("^%x%x%x%x%x%x$") then settings[key] = value saveSettings(false) refresh()
+        else input.Text = "#" .. settings[key] input.TextColor3 = Color3.fromRGB(255, 125, 125) end
+    end)
+    connect(swatch.Activated, function()
+        local index = table.find(colorPresets, settings[key]) or 0
+        settings[key] = colorPresets[index % #colorPresets + 1]
+        refresh() saveSettings(false)
+    end)
+    table.insert(refreshers, refresh)
+    refresh()
+    cursor = cursor + 69
+end
+colorControl("PlayerColor", "Player highlight color / HEX")
+colorControl("BotColor", "Bot highlight color / HEX")
+colorControl("OutlineColor", "Outline color / HEX")
+heading("ESP / DISPLAY")
+toggle("ESPHighlights", "Body highlights", "Show colored fills on character models")
+toggle("ESPOutline", "Character outlines", "Show an outline around each character")
+toggle("ESPNames", "Names", "Show player and bot names")
+toggle("ESPHealth", "Health", "Show remaining HP in the label")
+toggle("ESPDistance", "Distance", "Show distance from your camera in studs")
+toggle("ESPThroughWalls", "See through walls", "OFF = use normal depth occlusion")
+local function numberControl(key, caption, minimum, maximum, step, suffix)
+    local row = make("Frame", scroll, {Position = UDim2.fromOffset(0, cursor),
+        Size = UDim2.new(1, -8, 0, 62), BackgroundColor3 = Color3.fromRGB(25, 31, 43), BorderSizePixel = 0})
+    round(row, 9)
+    text(row, caption, UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 17), 12)
+    local input = make("TextBox", row, {Position = UDim2.fromOffset(48, 29), Size = UDim2.new(1, -96, 0, 25),
+        BackgroundColor3 = Color3.fromRGB(16, 21, 30), BorderSizePixel = 0, ClearTextOnFocus = false,
+        Font = Enum.Font.Code, TextSize = 12, TextColor3 = Color3.fromRGB(220, 232, 249)})
+    round(input, 5)
+    local function refresh() input.Text = tostring(settings[key]) .. suffix end
+    for _, direction in ipairs({-1, 1}) do
+        local button = make("TextButton", row, {Position = direction < 0 and UDim2.fromOffset(12, 29) or UDim2.new(1, -39, 0, 29),
+            Size = UDim2.fromOffset(27, 25), Text = direction < 0 and "-" or "+",
+            Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = accent,
+            BackgroundColor3 = Color3.fromRGB(40, 51, 73), BorderSizePixel = 0})
+        round(button, 5)
+        connect(button.Activated, function()
+            settings[key] = math.clamp(settings[key] + step * direction, minimum, maximum)
+            refresh() saveSettings(false)
+        end)
+    end
+    connect(input.FocusLost, function()
+        local value = tonumber(input.Text:match("^[%s]*([%d%.]+)"))
+        if value and value == value and value < math.huge then
+            settings[key] = math.clamp(math.floor(value + 0.5), minimum, maximum)
+            saveSettings(false)
+        end
+        refresh()
+    end)
+    table.insert(refreshers, refresh)
+    refresh()
+    cursor = cursor + 69
+end
+numberControl("ESPFillOpacity", "Fill opacity / 0 = invisible, 100 = solid", 0, 100, 10, "%")
+numberControl("ESPMaxDistance", "Maximum distance / 0 = unlimited", 0, 10000, 100, " studs")
+numberControl("ESPTextSize", "Label text size", 10, 24, 1, " px")
+heading("PLAYER")
+toggle("InfiniteJump", "Infinite Jump", "Press jump again while airborne")
+toggle("CustomSpeed", "Custom player speed", "OFF restores your normal movement speed")
+do
+    local row = make("Frame", scroll, {Position = UDim2.fromOffset(0, cursor), Size = UDim2.new(1, -8, 0, 102),
+        BackgroundColor3 = Color3.fromRGB(25, 31, 43), BorderSizePixel = 0})
+    round(row, 9)
+    text(row, "Player speed", UDim2.fromOffset(12, 9), UDim2.fromOffset(175, 20), 13)
+    local input = make("TextBox", row, {Position = UDim2.new(1, -80, 0, 8), Size = UDim2.fromOffset(66, 25),
+        BackgroundColor3 = Color3.fromRGB(16, 21, 30), TextColor3 = accent, BorderSizePixel = 0,
+        Font = Enum.Font.Code, TextSize = 13, ClearTextOnFocus = false})
+    round(input, 5)
+    local bar = make("Frame", row, {Position = UDim2.fromOffset(18, 51), Size = UDim2.new(1, -36, 0, 6),
+        BackgroundColor3 = Color3.fromRGB(51, 62, 82), BorderSizePixel = 0})
+    round(bar, 3)
+    local fill = make("Frame", bar, {BackgroundColor3 = accent, BorderSizePixel = 0, Size = UDim2.fromScale(0, 1)})
+    round(fill, 3)
+    local knob = make("Frame", bar, {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(16, 16),
+        BackgroundColor3 = Color3.fromRGB(239, 245, 255), BorderSizePixel = 0})
+    round(knob, 8)
+    local hit = make("TextButton", row, {Position = UDim2.fromOffset(10, 36), Size = UDim2.new(1, -20, 0, 36),
+        Text = "", BackgroundTransparency = 1, ZIndex = 3})
+    text(row, "0", UDim2.fromOffset(14, 76), UDim2.fromOffset(45, 15), 10, Color3.fromRGB(135, 151, 176))
+    text(row, "100 studs/s", UDim2.new(1, -92, 0, 76), UDim2.fromOffset(88, 15), 10, Color3.fromRGB(135, 151, 176))
+    local draggingSpeed = false
+    local function refresh()
+        input.Text = tostring(settings.PlayerSpeed)
+        local ratio = settings.PlayerSpeed / 100
+        fill.Size = UDim2.fromScale(ratio, 1)
+        knob.Position = UDim2.fromScale(ratio, 0.5)
+    end
+    local function update(x)
+        if bar.AbsoluteSize.X <= 0 then return end
+        settings.PlayerSpeed = math.floor(math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1) * 1000 + 0.5) / 10
+        settings.CustomSpeed = true
+        refresh()
+        for _, fn in ipairs(refreshers) do fn() end
+    end
+    connect(hit.InputBegan, function(event)
+        if event.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingSpeed = true scroll.ScrollingEnabled = false update(event.Position.X)
+        end
+    end)
+    connect(UIS.InputChanged, function(event)
+        if draggingSpeed and event.UserInputType == Enum.UserInputType.MouseMovement then update(event.Position.X) end
+    end)
+    connect(UIS.InputEnded, function(event)
+        if draggingSpeed and event.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingSpeed = false scroll.ScrollingEnabled = true saveSettings(false)
+        end
+    end)
+    connect(UIS.WindowFocusReleased, function()
+        if draggingSpeed then draggingSpeed = false scroll.ScrollingEnabled = true saveSettings(false) end
+    end)
+    connect(input.FocusLost, function()
+        local value = tonumber(input.Text)
+        if value and value == value and math.abs(value) < math.huge then
+            settings.PlayerSpeed = math.floor(math.clamp(value, 0, 100) * 10 + 0.5) / 10
+            settings.CustomSpeed = true
+            for _, fn in ipairs(refreshers) do fn() end
+            saveSettings(false)
+        end
+        refresh()
+    end)
+    table.insert(refreshers, refresh)
+    refresh()
+    cursor = cursor + 109
+end
+action("Reset to normal speed", function()
+    settings.CustomSpeed = false
+    restoreSpeed()
+    settings.PlayerSpeed = originalSpeed or 19.5
+    for _, refresh in ipairs(refreshers) do refresh() end
+    saveSettings(false)
+end)
+
+heading("04 / SETTINGS")
+toggle("AutoSave", "Save settings automatically", "Remember toggles, presets and window position")
+toggle("Diagnostics", "Diagnostics panel", "Show lock, firing reason and target counts")
+local pauseButton
+pauseButton = action("Pause aiming + shooting [F6]", function(button)
+    paused = not paused release() target = nil
+    button.Text = paused and "Resume aiming + shooting [F6]" or "Pause aiming + shooting [F6]"
+end)
+action("Save settings now", function(button)
+    saveSettings(true)
+    button.Text = saveState
+end)
+action("Reset settings", function()
+    for key, value in pairs(defaults) do settings[key] = value end
+    paused = false release() target = nil
+    for _, refresh in ipairs(refreshers) do refresh() end
+    radiusButton.Text = "Aim radius: " .. settings.FOVRadius .. " px"
+    presetButton.Text = "Firing preset: " .. settings.Preset .. " / " .. settings.ShotInterval .. "s"
+    pauseButton.Text = "Pause aiming + shooting [F6]"
+    saveSettings(true)
+end)
+scroll.CanvasSize = UDim2.fromOffset(0, cursor + 8)
+local card = make("Frame", content, {Position = UDim2.new(0, 12, 1, -126), Size = UDim2.new(1, -24, 0, 99),
+    BackgroundColor3 = Color3.fromRGB(20, 32, 38), BorderSizePixel = 0})
+round(card, 9)
+text(card, "LIVE STATUS", UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 15), 9, Color3.fromRGB(126, 190, 160))
+local status = text(card, "Ready", UDim2.fromOffset(12, 26), UDim2.new(1, -24, 0, 21), 11, Color3.fromRGB(211, 230, 221))
+status.TextTruncate = Enum.TextTruncate.AtEnd
+local diagnostics = text(card, "", UDim2.fromOffset(12, 50), UDim2.new(1, -24, 0, 44), 10, Color3.fromRGB(145, 166, 185))
+diagnostics.TextYAlignment = Enum.TextYAlignment.Top
+diagnostics.TextWrapped = true
+text(content, "F6  PAUSE     /     RSHIFT  HIDE     /     DRAG HEADER", UDim2.new(0, 17, 1, -21), UDim2.new(1, -24, 0, 16), 9, Color3.fromRGB(111, 130, 160))
+local collapsed = false
+connect(collapse.Activated, function()
+    collapsed = not collapsed collapse.Text = collapsed and "+" or "-"
+    content.Visible = not collapsed
+    panel.Size = UDim2.fromOffset(370, collapsed and 74 or panelHeight)
+end)
+local dragging, dragStart, panelStart = false, nil, nil
+connect(header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and input.Position.X < collapse.AbsolutePosition.X - 5 then
+        dragging = true dragStart = input.Position panelStart = panel.AbsolutePosition
+    end
+end)
+connect(UIS.InputChanged, function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        local size = workspace.CurrentCamera.ViewportSize
+        panel.Position = UDim2.fromOffset(math.clamp(panelStart.X + delta.X, 0, math.max(0, size.X - 370)),
+            math.clamp(panelStart.Y + delta.Y, 0, math.max(0, size.Y - 74)))
+    end
+end)
+connect(UIS.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and dragging then dragging = false saveSettings(false) end
+end)
+connect(UIS.InputBegan, function(input)
+    if UIS:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then panel.Visible = not panel.Visible end
+    if input.KeyCode == Enum.KeyCode.F6 then
+        paused = not paused release() target = nil
+        pauseButton.Text = paused and "Resume aiming + shooting [F6]" or "Pause aiming + shooting [F6]"
+    end
+end)
+local fovCircle = make("Frame", gui, {AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(settings.FOVRadius * 2, settings.FOVRadius * 2)})
+round(fovCircle, 10000)
+make("UIStroke", fovCircle, {Color = accent, Thickness = 1, Transparency = 0.4})
+local diagnosticTimer = 0
+
+local holder = Instance.new("Folder")
+holder.Name = "SniperDuelsESP"
+holder.Parent = gui
+local function track(p)
+    if p == me or entries[p] then return end
+    local hl = Instance.new("Highlight")
+    hl.FillColor = Color3.fromRGB(255, 0, 0)
+    hl.OutlineColor = Color3.fromRGB(255, 30, 30)
+    hl.FillTransparency = 0.5
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Enabled = false
+    hl.Parent = holder
+    local bb = Instance.new("BillboardGui")
+    bb.Size = UDim2.fromOffset(180, 30)
+    bb.StudsOffset = Vector3.new(0, 2, 0)
+    bb.AlwaysOnTop = true
+    bb.LightInfluence = 0
+    bb.MaxDistance = 0
+    bb.Enabled = false
+    bb.Parent = holder
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 13
+    label.TextColor3 = Color3.fromRGB(255, 50, 50)
+    label.TextStrokeTransparency = 0
+    label.Parent = bb
+    entries[p] = {hl = hl, bb = bb, label = label}
+end
+for _, p in ipairs(Players:GetPlayers()) do track(p) end
+connect(Players.PlayerAdded, track)
+connect(Players.PlayerRemoving, function(p)
+    local e = entries[p]
+    if e then e.hl:Destroy() e.bb:Destroy() entries[p] = nil end
+end)
+-- Bot adapters share the same aiming / firing / ESP pipeline as players.
+local botAdapters = {}
+local function botCharacter(entity)
+    if entity:FindFirstChild("Head") then return entity end
+    local collider = nil
+    for _, child in ipairs(entity:GetChildren()) do
+        if child:IsA("Model") and child:FindFirstChild("Head") then
+            if child:FindFirstChildOfClass("Humanoid") then return child end
+            collider = child
+        end
+    end
+    return collider
+end
+local function discoverBot(entity)
+    if not entity:IsA("Model") or not entity:IsDescendantOf(workspace) then return end
+    if entity:GetAttribute("FakeUserId") == nil or entity:GetAttribute("_entityModel") == nil then return end
+    if botAdapters[entity] then return end
+    local adapter = setmetatable({
+        GetAttribute = function(_, name) return entity:GetAttribute(name) end,
+    }, {__index = function(_, key)
+        if key == "Name" then return entity.Name .. " [BOT]" end
+        if key == "Character" then return botCharacter(entity) end
+        if key == "Parent" then return entity:IsDescendantOf(workspace) and Players or nil end
+    end})
+    botAdapters[entity] = adapter
+    track(adapter)
+end
+local function scanBots()
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("Model") and instance:GetAttribute("FakeUserId") ~= nil then discoverBot(instance) end
+    end
+    for entity, adapter in pairs(botAdapters) do
+        if not entity:IsDescendantOf(workspace) then
+            local e = entries[adapter]
+            if e then e.hl:Destroy() e.bb:Destroy() entries[adapter] = nil end
+            if target == adapter then target = nil release() end
+            botAdapters[entity] = nil
+        end
+    end
+end
+scanBots()
+connect(workspace.DescendantAdded, function(instance)
+    if instance:IsA("Model") then task.defer(function()
+        if gui.Parent then discoverBot(instance) end
+    end) end
+end)
+local botScanElapsed = 0
+connect(RunService.Heartbeat, function(dt)
+    botScanElapsed = botScanElapsed + dt
+    if botScanElapsed >= 1 then botScanElapsed = 0 scanBots() end
+end)
+local botCount = 0
+for _ in pairs(botAdapters) do botCount = botCount + 1 end
+print("[Sniper Duels] Bot targeting enabled; discovered", botCount, "bot entities.")
+local binding = "SniperDuelsAim"
+RunService:BindToRenderStep(binding, Enum.RenderPriority.Last.Value + 100, function()
+    local camera = workspace.CurrentCamera
+    if not camera then release() return end
+    local center = camera.ViewportSize / 2
+    fovCircle.Position = UDim2.fromOffset(center.X, center.Y)
+    fovCircle.Size = UDim2.fromOffset(settings.FOVRadius * 2, settings.FOVRadius * 2)
+    fovCircle.Visible = settings.FOVEnabled and settings.Aim and not paused
+    diagnosticTimer = diagnosticTimer + 1
+    diagnostics.Visible = settings.Diagnostics
+    if settings.Diagnostics and diagnosticTimer % 12 == 0 then
+        local playerCount, botCount = 0, 0
+        for candidate in pairs(entries) do
+            if validEnemy(candidate, true) then
+                if type(candidate) == "table" then botCount = botCount + 1 else playerCount = playerCount + 1 end
+            end
+        end
+        diagnostics.Text = "Players: " .. playerCount .. "  /  Bots: " .. botCount
+            .. "\nPreset: " .. settings.Preset .. " (" .. settings.ShotInterval .. "s)  /  " .. saveState
+    end
+    for p, e in pairs(entries) do
+        local head, c, h = validEnemy(p, true)
+        local isBot = type(p) == "table"
+        local distance = head and (camera.CFrame.Position - head.Position).Magnitude or 0
+        local show = ((isBot and settings.BotESP) or (not isBot and settings.ESP)) and head ~= nil
+            and (settings.ESPMaxDistance == 0 or distance <= settings.ESPMaxDistance)
+        local hasLabel = settings.ESPNames or settings.ESPHealth or settings.ESPDistance
+        e.hl.Enabled = show and (settings.ESPHighlights or settings.ESPOutline)
+        e.bb.Enabled = show and hasLabel
+        if show then
+            local color = Color3.fromHex(isBot and settings.BotColor or settings.PlayerColor)
+            e.hl.FillColor = color
+            e.hl.OutlineColor = Color3.fromHex(settings.OutlineColor)
+            e.hl.FillTransparency = settings.ESPHighlights and (1 - settings.ESPFillOpacity / 100) or 1
+            e.hl.OutlineTransparency = settings.ESPOutline and 0 or 1
+            e.hl.DepthMode = settings.ESPThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
+            e.label.TextColor3 = color
+            e.label.TextSize = settings.ESPTextSize
+            e.hl.Adornee = c
+            e.bb.Adornee = head
+            e.bb.AlwaysOnTop = settings.ESPThroughWalls
+            e.bb.Size = UDim2.fromOffset(math.max(180, settings.ESPTextSize * 20), settings.ESPTextSize + 16)
+            local parts = {}
+            if settings.ESPNames then table.insert(parts, p.Name) end
+            if settings.ESPHealth then table.insert(parts, math.ceil(h.Health) .. " HP") end
+            if settings.ESPDistance then table.insert(parts, math.floor(distance) .. " studs") end
+            e.label.Text = table.concat(parts, " | ")
+        end
+    end
+    local now = os.clock()
+    if held and now >= releaseAt then release() end
+    local myHumanoid = me.Character and me.Character:FindFirstChildOfClass("Humanoid")
+    if paused or not settings.Aim or not focused or UIS:GetFocusedTextBox()
+        or (settings.HoldAim and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+        or not myHumanoid or myHumanoid.Health <= 0 then
+        target = nil
+        status.Text = paused and "Paused [F6 to resume]"
+            or not settings.Aim and "Auto aim OFF"
+            or not focused and "Game window unfocused"
+            or UIS:GetFocusedTextBox() and "Typing: aim paused"
+            or settings.HoldAim and "Hold right-click to aim"
+            or "Waiting for respawn"
+        release()
+        return
+    end
+    local function aimable(p, retaining)
+        local head = validEnemy(p)
+        if not head then return nil end
+        local point, onscreen = camera:WorldToViewportPoint(head.Position)
+        local direction = head.Position - camera.CFrame.Position
+        if direction.Magnitude < 0.01 then return nil end
+        local alignment = camera.CFrame.LookVector:Dot(direction.Unit)
+        -- Acquire in front. Keep an existing lock near the viewport edge.
+        if alignment <= 0 or (not retaining and (not onscreen or point.Z <= 0)) then return nil end
+        if not retaining and settings.FOVEnabled
+            and (Vector2.new(point.X, point.Y) - center).Magnitude > settings.FOVRadius then return nil end
+        if not visible(camera, head) then return nil end
+        return head, alignment
+    end
+    -- Replace a bot lock if a real player becomes aimable.
+    if type(target) == "table" then
+        for candidate in pairs(entries) do
+            if type(candidate) ~= "table" and aimable(candidate, false) then target = nil break end
+        end
+    end
+    local head = target and aimable(target, true)
+    if head then
+        lastVisibleAt = now
+    elseif target and validEnemy(target) and now - lastVisibleAt < retentionGrace then
+        -- Brief occlusion: keep the target identity without aiming/firing through cover.
+        release()
+        acquiredAt = now
+        status.Text = "Holding lock: " .. target.Name .. " | Obstructed"
+        return
+    else
+        target = nil
+        local bestAlignment = -1
+        local bestClass = math.huge
+        for p in pairs(entries) do
+            local part, alignment = aimable(p, false)
+            local class = type(p) == "table" and 1 or 0
+            if part and (class < bestClass or (class == bestClass and alignment > bestAlignment)) then
+                bestClass = class
+                bestAlignment = alignment
+                target = p
+                head = part
+            end
+        end
+        acquiredAt = now
+        if head then lastVisibleAt = now end
+    end
+    if not head then status.Text = "Looking for a visible target in front" release() return end
+    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, head.Position)
+    status.Text = "Locked: " .. target.Name .. (settings.Shoot and " | Auto shoot ON" or "")
+    if not settings.Shoot then status.Text = "Locked: " .. target.Name .. " | Auto shoot OFF" release() return end
+    if me:GetAttribute("combatPaused") == true or target:GetAttribute("combatPaused") == true then
+        status.Text = "Locked: " .. target.Name .. " | Shooting paused by game"
+        release()
+        return
+    end
+    local targetCharacter = target.Character
+    local shield = target:GetAttribute("TempShield")
+    if (targetCharacter and targetCharacter:FindFirstChildOfClass("ForceField"))
+        or (type(shield) == "number" and shield > 0) then status.Text = "Locked: " .. target.Name .. " | Shield active" release() return end
+    -- Confirm lock over successive frames before the first shot.
+    if now - acquiredAt < 0.05 then status.Text = "Locked: " .. target.Name .. " | Confirming aim" return end
+    if now < nextShot or held then
+        status.Text = "Locked: " .. target.Name .. " | Cooldown " .. string.format("%.2fs", math.max(0, nextShot - now))
+        return
+    end
+    local delta = head.Position - camera.CFrame.Position
+    if delta.Magnitude < 0.01 or camera.CFrame.LookVector:Dot(delta.Unit) < math.cos(math.rad(0.2)) then return end
+    if not visible(camera, head) then status.Text = "Shot blocked by cover" release() return end
+    if type(mouse1press) ~= "function" or type(mouse1release) ~= "function" then status.Text = "Mouse input API unavailable" return end
+    mouse1press()
+    status.Text = "Fired: " .. target.Name
+    held = true
+    releaseAt = now + 0.03
+    nextShot = now + settings.ShotInterval
+end)
+env.SniperDuelsCleanup = function()
+    RunService:UnbindFromRenderStep("SniperDuelsSpeed")
+    if speedPropertyConnection then speedPropertyConnection:Disconnect() end
+    restoreSpeed()
+    RunService:UnbindFromRenderStep(binding)
+    release()
+    for _, c in ipairs(connections) do c:Disconnect() end
+    saveSettings(false)
+    gui:Destroy()
+    table.clear(entries)
+end
+print("[Sniper Duels] All features loaded: FOV, hold aim, bot ESP, firing presets, saved settings, F6 pause and diagnostics.")
+
+print("[Sniper Duels] ESP customization loaded: HEX colors, separate bot/player colors, outlines, labels, distance, opacity and depth controls.")
+
+print("[Sniper Duels] Player section loaded: Infinite Jump toggle (OFF by default).")
+
+print("[Sniper Duels] Player speed slider loaded: 0-100 studs/s, numeric entry, enable toggle and normal-speed reset.")
+
+print("[Sniper Duels] Speed now updates the game movement attribute and Humanoid before movement simulation.")
+
+
+
+print("[Sniper Duels] Knife teleport removed: UI option and right-click teleport/attack handlers deleted.")
